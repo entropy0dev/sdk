@@ -1,0 +1,35 @@
+name: Publish entropy0-langchain to PyPI
+
+on:
+  push:
+    tags:
+      - "langchain/v*"   # trigger: git tag langchain/v0.1.0 && git push --tags
+
+jobs:
+  publish:
+    name: Build and publish to PyPI
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tools
+        run: pip install hatchling build twine
+
+      - name: Build
+        working-directory: packages/langchain
+        run: python -m build
+
+      - name: Publish to PyPI
+        working-directory: packages/langchain
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: twine upload dist/*

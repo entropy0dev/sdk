@@ -1,0 +1,36 @@
+name: Publish @entropy0/express to npm
+
+on:
+  push:
+    tags:
+      - "express/v*"   # trigger: git tag express/v0.1.0 && git push --tags
+
+jobs:
+  publish:
+    name: Build and publish to npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install dependencies
+        working-directory: packages/express
+        run: npm ci
+
+      - name: Build
+        working-directory: packages/express
+        run: npm run build
+
+      - name: Publish to npm
+        working-directory: packages/express
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
