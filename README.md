@@ -29,6 +29,12 @@ import { entropy0Guard } from "@entropy0/express";
 app.use(entropy0Guard({ apiKey: process.env.ENTROPY0_API_KEY! }));
 ```
 
+## Examples
+
+| Example | Description |
+|---|---|
+| [`examples/rag-agent`](examples/rag-agent) | LangChain agent that trust-gates every URL before fetching content |
+
 ## Links
 
 - [API reference](https://entropy0.ai/docs)
