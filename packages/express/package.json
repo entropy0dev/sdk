@@ -1,6 +1,6 @@
 {
   "name": "@entropy0/express",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Entropy0 Trust Control Plane middleware for Express.js — gate requests through trust evaluation before your server processes them.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
