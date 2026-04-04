@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "entropy0-langchain"
+version = "0.1.0"
+description = "Entropy0 Trust Control Plane tool for LangChain agents — evaluate domains and URLs before your agent fetches content from them."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Entropy0", email = "dev@entropy0.ai" }]
+maintainers = [{ name = "entropy0", email = "dev@entropy0.ai" }]
+keywords = [
+  "langchain", "trust", "security", "domain-intelligence",
+  "ai-agents", "rag", "llm", "trust-control-plane"
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Topic :: Security",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+requires-python = ">=3.9"
+dependencies = [
+  "langchain-core>=0.1.0",
+  "httpx>=0.24.0",
+  "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "pytest-asyncio>=0.21",
+  "respx>=0.20",
+  "langchain>=0.1.0",
+]
+
+[project.urls]
+Homepage      = "https://entropy0.ai"
+Documentation = "https://entropy0.ai/docs"
+Repository    = "https://github.com/entropy0dev/sdk"
+"Bug Tracker" = "https://github.com/entropy0dev/sdk/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["entropy0_langchain"]
