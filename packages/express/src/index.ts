@@ -11,14 +11,49 @@ export type RecommendedAction =
 
 export interface DecisionResult {
   request_id: string;
+  version: string;
+  target: {
+    type: "domain" | "url";
+    value: string;
+    normalized: string;
+  };
+  interaction: {
+    kind: string;
+    mode: string;
+    sensitivity: string;
+  };
+  policy_applied: {
+    profile: string;
+    policy_version: string;
+  };
+  scores: {
+    trust:     { score: number; confidence: number };
+    threat:    { score: number; confidence: number };
+    deviation: { score: number; confidence: number };
+  };
   decision: {
     recommended_action: RecommendedAction;
     action_confidence: number;
     reason_codes: string[];
+    decision_rationale: {
+      primary_reason_codes: string[];
+      uncertainty_influencers: string[];
+    };
   };
   uncertainty: {
     state: "low" | "medium" | "high";
     requires_human_review: boolean;
+    drivers: string[];
+  };
+  evidence?: {
+    highlights: Array<{
+      code: string;
+      label: string;
+      impact: "positive" | "negative" | "mixed";
+      strength: number;
+    }>;
+    highlights_truncated: boolean;
+    source_count: number;
   };
   validity: {
     evaluated_at: string;
