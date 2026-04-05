@@ -4,6 +4,7 @@ Entropy0 Trust Control Plane tool for LangChain agents.
 
 Evaluates any domain or URL through the Entropy0 `/v1/decide` endpoint before your agent fetches content from it. Returns a machine-readable recommended action the agent can reason about directly.
 
+**[Try it live →](https://entropy0.ai/playground)** — scan any domain instantly, no sign-up required.
 **Get a free API key at [entropy0.ai/signup](https://entropy0.ai/signup)** — no credit card required.
 
 ## Install

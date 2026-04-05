@@ -4,6 +4,7 @@ Entropy0 Trust Control Plane middleware for Express.js.
 
 Evaluates an incoming request's target domain through the Entropy0 `/v1/decide` endpoint and routes it to the appropriate handler based on the recommended action — before your application logic runs.
 
+**[Try it live →](https://entropy0.ai/playground)** — scan any domain instantly, no sign-up required.
 **Get a free API key at [entropy0.ai/signup](https://entropy0.ai/signup)** — no credit card required.
 
 ## Install
