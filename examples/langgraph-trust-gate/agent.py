@@ -1,45 +1,44 @@
 """
 Entropy0 trust gate for LangGraph
 
-Pipeline: Search -> Trust gate -> Extract -> Evidence scoring -> Synthesize
+Pipeline: Search → Trust gate → Extract → Evidence scoring → Synthesize
 
-Every URL returned by web search is evaluated through the Entropy0 /v1/decide
-endpoint before content enters the model context. Approved URLs are extracted
-via Tavily Extract (clean markdown, not raw HTML). A second layer — evidence
-usability scoring — classifies whether the extracted text is actually useful
-for answering the question. Sources that return sandbox or deny are logged and
-skipped. Trust and evidence metadata is attached to each step so it appears in
-LangSmith traces.
+Every URL returned by web search passes through two quality gates before the
+model generates an answer:
 
-Two distinct quality gates:
-  1. Entropy0 trust gate   — should this source enter the agent workflow?
-  2. Evidence usability    — did we retrieve enough text to safely cite it?
+  1. Entropy0 trust gate   — evaluates source trustworthiness via /v1/decide
+  2. Evidence usability    — classifies whether extracted text is usable
 
-An approved source with boilerplate-dominant extraction is clearly labelled
-so the synthesis step can calibrate confidence correctly.
+No Tavily API key required. Search uses DuckDuckGo (free, no key).
+Extraction uses trafilatura (free, no key).
 
 Setup:
     pip install -r requirements.txt
 
     export ENTROPY0_API_KEY=sk_ent0_...
     export ANTHROPIC_API_KEY=sk-ant-...
-    export TAVILY_API_KEY=tvly-...
     export LANGCHAIN_API_KEY=ls__...       # optional — enables LangSmith tracing
     export LANGCHAIN_TRACING_V2=true       # optional
 
-Run:
+Run (web search mode):
     python agent.py "what are the risks of prompt injection in LLM agents?"
+
+Run (bring your own URLs — skip search):
+    python agent.py --urls https://owasp.org https://example.com
+    python agent.py "my query" --urls https://owasp.org https://example.com
 """
 
+import argparse
 import os
 import re
 import sys
 import httpx
+import trafilatura
 from typing import TypedDict
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
 from langchain_anthropic import ChatAnthropic
-from langchain_tavily import TavilySearch, TavilyExtract
+from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 from langsmith import traceable
 
 load_dotenv()
@@ -71,8 +70,10 @@ BOILERPLATE_SIGNALS = [
     "copyright ©", "consent", "gdpr", "terms of service",
 ]
 
+
 def is_ugc(url: str) -> bool:
     return any(d in url for d in UGC_DOMAINS)
+
 
 def infer_sandbox_reason(trust: float, threat: float, deviation: float) -> list[str]:
     """Derive sandbox reason from scores when API codes are all positive signals."""
@@ -85,9 +86,10 @@ def infer_sandbox_reason(trust: float, threat: float, deviation: float) -> list[
         codes.append("INSUFFICIENT_TRUST_BAND")
     return codes or ["SCORE_BASED_GATE"]
 
+
 def score_evidence_usability(text: str) -> dict:
     """
-    Classify extracted content quality into one of four tiers.
+    Classify extracted content quality into one of five tiers.
 
     Returns:
       content_status     — body_text_captured / partial / title_only /
@@ -141,6 +143,23 @@ def score_evidence_usability(text: str) -> dict:
     }
 
 
+def extract_text(url: str) -> str:
+    """Extract article text from a URL using trafilatura. Never throws."""
+    try:
+        downloaded = trafilatura.fetch_url(url)
+        if not downloaded:
+            return ""
+        text = trafilatura.extract(
+            downloaded,
+            include_comments=False,
+            include_tables=True,
+            no_fallback=False,
+        )
+        return (text or "").strip()
+    except Exception:
+        return ""
+
+
 # ── State ─────────────────────────────────────────────────────────────────────
 
 class ResearchState(TypedDict):
@@ -186,18 +205,17 @@ def check_url(url: str) -> dict:
                 "error": f"HTTP {r.status_code}",
             }
 
-        d      = r.json()
-        action = d["decision"]["recommended_action"]
+        d           = r.json()
+        action      = d["decision"]["recommended_action"]
         trust_codes = d["decision"]["reason_codes"]
-
-        trust  = d["scores"]["trust"]["score"]
-        threat = d["scores"]["threat"]["score"]
-        dev    = d["scores"]["deviation"]["score"]
+        trust       = d["scores"]["trust"]["score"]
+        threat      = d["scores"]["threat"]["score"]
+        dev         = d["scores"]["deviation"]["score"]
 
         # Separate trust signal from decision rationale.
         # Case 1 — UGC: platform trust ≠ content trust.
-        # Case 2 — Sandboxed with only positive codes: the sandbox decision came
-        #          from score thresholds, not from these signals — derive from scores.
+        # Case 2 — Sandboxed with only positive codes: sandbox came from score
+        #          thresholds, not from these signals — derive reason from scores.
         if is_ugc(url):
             decision_codes = ["USER_GENERATED_CONTENT", "REQUIRES_CORROBORATION"]
         elif (action in ("sandbox", "escalate_to_human", "deny") and
@@ -235,10 +253,18 @@ def check_url(url: str) -> dict:
 
 @traceable(name="search")
 def search_node(state: ResearchState) -> dict:
-    tool   = TavilySearch(max_results=6, search_depth="advanced")
-    result = tool.invoke(state["query"])
-    items  = result.get("results", []) if isinstance(result, dict) else result
-    urls   = [r["url"] for r in items if isinstance(r, dict) and "url" in r]
+    """
+    If URLs were pre-populated (--urls flag), skip search.
+    Otherwise run DuckDuckGo — free, no API key required.
+    """
+    if state["urls"]:
+        print(f"[search] using {len(state['urls'])} provided URLs — skipping search")
+        return {}
+
+    wrapper = DuckDuckGoSearchAPIWrapper(max_results=6)
+    results = wrapper.results(state["query"], max_results=6)
+    urls    = [r["link"] for r in results if "link" in r]
+    print(f"[search] {len(urls)} URLs from DuckDuckGo")
     return {"urls": urls}
 
 
@@ -292,37 +318,29 @@ def trust_gate_node(state: ResearchState) -> dict:
 @traceable(name="extract_content")
 def fetch_node(state: ResearchState) -> dict:
     """
-    Use Tavily Extract to pull clean markdown from approved URLs, then score
-    each result for evidence usability. Boilerplate-dominant or title-only
+    Extract article text from approved URLs using trafilatura, then score
+    each result for evidence usability. Boilerplate-dominant or unusable
     extraction is flagged so the synthesis step can calibrate confidence.
     """
     if not state["approved"]:
         return {"content": [], "evidence_quality": []}
 
-    approved_urls = [ev["url"] for ev in state["approved"]]
-    ev_by_url     = {ev["url"]: ev for ev in state["approved"]}
-
-    try:
-        extractor = TavilyExtract(extract_depth="advanced", format="markdown", include_images=False)
-        result    = extractor.invoke({"urls": approved_urls})
-    except Exception as e:
-        print(f"[extract] TavilyExtract failed: {e}")
-        return {"content": [], "evidence_quality": []}
-
     content          = []
     evidence_quality = []
 
-    for item in result.get("results", []):
-        url   = item.get("url", "")
-        title = item.get("title", "")
-        text  = (item.get("raw_content") or "").strip()
-        ev    = ev_by_url.get(url, {})
-        eq    = score_evidence_usability(text)
+    for ev in state["approved"]:
+        url  = ev["url"]
+        text = extract_text(url)
+        eq   = score_evidence_usability(text)
 
-        evidence_quality.append({"url": url, "title": title, **eq})
+        evidence_quality.append({"url": url, **eq})
 
         if not text:
+            unverified_ev = {**ev, "action": "unverified", "decision_reason_codes": ["CONTENT_UNAVAILABLE"]}
+            state["unverified"].append(unverified_ev)
+            print(f"  UNVERIFIED {url} — extraction failed")
             continue
+
         content.append(
             f"[Source: {url}]\n"
             f"[Entropy0: trust={ev.get('trust','?')} threat={ev.get('threat','?')} "
@@ -331,31 +349,16 @@ def fetch_node(state: ResearchState) -> dict:
             f"{text[:3000]}"
         )
 
-    for item in result.get("failed_results", []):
-        url = item.get("url", "")
-        ev  = ev_by_url.get(url, {})
-        ev["action"]               = "unverified"
-        ev["decision_reason_codes"] = ["CONTENT_UNAVAILABLE"]
-        state["unverified"].append(ev)
-        evidence_quality.append({
-            "url":                  url,
-            "title":                "",
-            "content_status":       "unusable",
-            "evidence_usability":   "none",
-            "content_reason_codes": ["CONTENT_UNAVAILABLE"],
-        })
-        print(f"  UNVERIFIED {url} — extraction failed")
-
-    _USABILITY_ICON = {
-        "body_text_captured":  "✓",
-        "partial":             "~",
-        "title_only":          "!",
-        "boilerplate_dominant":"!",
-        "unusable":            "✗",
+    _ICON = {
+        "body_text_captured":   "[+]",
+        "partial":              "[~]",
+        "title_only":           "[!]",
+        "boilerplate_dominant": "[!]",
+        "unusable":             "[x]",
     }
     print("\n[evidence layer]")
     for eq in evidence_quality:
-        icon = _USABILITY_ICON.get(eq["content_status"], "?")
+        icon = _ICON.get(eq["content_status"], "?")
         print(f"  {icon} {eq['url']}")
         print(f"    {eq['content_status']} — usability={eq['evidence_usability']} {eq['content_reason_codes']}")
 
@@ -378,10 +381,8 @@ def synthesize_node(state: ResearchState) -> dict:
     ]
     eq_summary = "\n".join(eq_lines) if eq_lines else "  (no evidence quality data)"
 
-    if state["content"]:
-        context = "\n\n---\n\n".join(state["content"])
-    else:
-        context = "No usable content was extracted from approved sources."
+    context = "\n\n---\n\n".join(state["content"]) if state["content"] else \
+              "No usable content was extracted from approved sources."
 
     response = llm.invoke([{
         "role": "user",
@@ -392,12 +393,11 @@ def synthesize_node(state: ResearchState) -> dict:
             f"Content from approved sources only:\n\n{context}\n\n"
             "Answer the research question based solely on the approved sources above.\n"
             "Calibrate confidence strictly by evidence usability:\n"
-            "- usability=high: cite directly, high confidence\n"
+            "- usability=high:   cite directly with high confidence\n"
             "- usability=medium: cite with a caveat (partial extraction)\n"
-            "- usability=low: note the source exists but do not assert specific claims from it\n"
-            "- usability=none: mark as unusable, do not cite\n"
-            "If extraction returned boilerplate rather than article text, say so explicitly "
-            "as an evidence quality warning — do not fabricate or infer details."
+            "- usability=low:    note the source exists but make no specific claims\n"
+            "- usability=none:   mark as unusable, do not cite\n"
+            "Do not fabricate or infer details not present in the retrieved content."
         ),
     }])
     return {"answer": response.content}
@@ -424,13 +424,34 @@ def build_graph():
 # ── Run ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    query = " ".join(sys.argv[1:]) or "what are the risks of prompt injection in LLM agents?"
-    print(f"Query: {query}\n")
+    parser = argparse.ArgumentParser(description="Entropy0 trust gate for LangGraph")
+    parser.add_argument(
+        "query",
+        nargs="?",
+        default="what are the risks of prompt injection in LLM agents?",
+        help="Research question (used for search and synthesis)",
+    )
+    parser.add_argument(
+        "--urls",
+        nargs="+",
+        metavar="URL",
+        help="Skip search and evaluate these URLs directly through the trust gate",
+    )
+    args = parser.parse_args()
+
+    query        = args.query
+    initial_urls = args.urls or []
+
+    if initial_urls:
+        print(f"Query:  {query}")
+        print(f"URLs:   {initial_urls}\n")
+    else:
+        print(f"Query: {query}\n")
 
     graph  = build_graph()
     result = graph.invoke({
         "query":            query,
-        "urls":             [],
+        "urls":             initial_urls,
         "approved":         [],
         "sandboxed":        [],
         "denied":           [],
@@ -449,7 +470,7 @@ if __name__ == "__main__":
         print("\n" + "=" * 60)
         print("EVIDENCE LAYER")
         print("=" * 60)
-        _STATUS_LABEL = {
+        _LABEL = {
             "body_text_captured":   "FULL",
             "partial":              "PARTIAL",
             "title_only":           "TITLE",
@@ -457,7 +478,7 @@ if __name__ == "__main__":
             "unusable":             "UNUSABLE",
         }
         for eq in result["evidence_quality"]:
-            label = _STATUS_LABEL.get(eq["content_status"], eq["content_status"].upper())
+            label = _LABEL.get(eq["content_status"], eq["content_status"].upper())
             print(f"  [{label}]  {eq['url']}")
             print(f"             usability={eq['evidence_usability']}  {eq.get('content_reason_codes', [])}")
 

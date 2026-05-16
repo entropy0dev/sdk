@@ -38,19 +38,27 @@ pip install -r requirements.txt
 
 export ENTROPY0_API_KEY=sk_ent0_...
 export ANTHROPIC_API_KEY=sk-ant-...
-export TAVILY_API_KEY=tvly-...
 
 # Optional: LangSmith tracing
 export LANGCHAIN_API_KEY=ls__...
 export LANGCHAIN_TRACING_V2=true
 ```
 
+No Tavily key required. Search uses DuckDuckGo (free). Extraction uses trafilatura (free).
+
 Get an Entropy0 API key at [entropy0.ai](https://entropy0.ai).
 
 ## Run
 
 ```bash
+# Web search mode — DuckDuckGo finds candidate URLs automatically
 python agent.py "what are the risks of prompt injection in LLM agents?"
+
+# Bring your own URLs — skip search, evaluate specific sources directly
+python agent.py --urls https://owasp.org/www-project-top-ten/ https://example.com
+
+# Both — use your URLs but provide a query for synthesis context
+python agent.py "prompt injection risks" --urls https://owasp.org https://arxiv.org/abs/2302.12173
 ```
 
 ## Example output
