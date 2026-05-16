@@ -5,7 +5,7 @@ Entropy0 makes that distinction visible before the agent answers.
 
 ## Try it on your own URLs right now
 
-Two API keys. No other dependencies.
+Two API keys. No search API key required.
 
 ```bash
 pip install -r requirements.txt
@@ -17,8 +17,6 @@ python agent.py --urls https://genai.owasp.org/llmrisk/llm01-prompt-injection/ h
 ```
 
 Pass any URLs you want to evaluate. The agent runs each through the Entropy0 trust gate, scores the extracted content for usability, then answers only from what was actually retrieved.
-
-No Tavily key. No search API signup. Search uses DuckDuckGo (free). Extraction uses trafilatura (free).
 
 Get an Entropy0 API key at [entropy0.ai](https://entropy0.ai).
 
@@ -44,15 +42,41 @@ The key distinction:
 
 ## Run modes
 
+### 1. URL mode — recommended
+
+No search provider or API key required.
+
 ```bash
-# Bring your own URLs — skip search, run the trust gate on sources you choose
-python agent.py --urls https://genai.owasp.org/llmrisk/llm01-prompt-injection/ https://arxiv.org/abs/2302.12173
+python agent.py --urls \
+  https://genai.owasp.org/llmrisk/llm01-prompt-injection/ \
+  https://owasp.org
+```
 
-# With a custom question for synthesis context
-python agent.py "what are the risks of prompt injection?" --urls https://genai.owasp.org/llmrisk/llm01-prompt-injection/
+Pipeline:
 
-# Web search mode — DuckDuckGo finds candidate URLs automatically
+```
+Provided URLs → Entropy0 trust gate → Extract → Evidence scoring → Synthesize
+```
+
+Optionally provide a question for synthesis context:
+
+```bash
+python agent.py "what are the risks of prompt injection?" \
+  --urls https://genai.owasp.org/llmrisk/llm01-prompt-injection/
+```
+
+### 2. Search mode — optional
+
+Requires `ddgs` (already in `requirements.txt`):
+
+```bash
 python agent.py "what are the risks of prompt injection in LLM agents?"
+```
+
+Pipeline:
+
+```
+Search → Entropy0 trust gate → Extract → Evidence scoring → Synthesize
 ```
 
 ---
