@@ -23,6 +23,7 @@ POST /v1/decide
 |---|---|---|
 | [`entropy0-langchain`](packages/langchain) | PyPI | LangChain tool — trust-gate URLs before agents fetch from them |
 | [`@entropy0/express`](packages/express) | npm | Express middleware — evaluate request targets through `/v1/decide` |
+| [`@entropy0/mcp`](packages/mcp) | npm | MCP server — source trust and URL safety tools for Claude Desktop, Cursor, Cline |
 
 ---
 
@@ -79,6 +80,37 @@ No probabilistic black boxes. Auditable, explainable, overridable.
 | Example | Description |
 |---|---|
 | [`examples/rag-agent`](examples/rag-agent) | LangChain agent that trust-gates every URL before fetching content |
+| [`examples/langgraph-trust-gate`](examples/langgraph-trust-gate) | LangGraph pipeline with Entropy0 trust gate + evidence usability scoring |
+
+### LangGraph trust gate demo
+
+This example shows a four-layer retrieval pipeline:
+
+1. Search returns candidate sources
+2. Entropy0 evaluates whether each source should enter the workflow
+3. The extraction layer retrieves page content
+4. The evidence usability layer determines whether the agent can safely cite the content
+
+Example run:
+
+```
+[entropy0] 5 approved / 1 sandboxed / 0 denied / 0 unverified
+  SANDBOX    outpost24.com
+             trust signals: ['LONG_OPERATIONAL_HISTORY', 'STRONG_BRAND_ALIGNMENT']
+             sandbox reason: ['ELEVATED_DEVIATION']
+
+[evidence layer]
+  ! microsoft.com/security/blog/...   boilerplate_dominant — usability=low
+  ! genai.owasp.org/llmrisk/...       boilerplate_dominant — usability=low
+  ✓ pmc.ncbi.nlm.nih.gov/...          body_text_captured   — usability=high
+  ✓ securecodewarrior.com/...         body_text_captured   — usability=high
+```
+
+The agent answered only from high-usability evidence and refused to attribute claims to sources where article body text was not captured.
+
+This prevents a common failure mode in AI search agents:
+
+> Treating a reputable URL as equivalent to usable evidence.
 
 ---
 

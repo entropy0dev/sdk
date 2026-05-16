@@ -1,7 +1,7 @@
 # Entropy0 trust gate for LangGraph
 
-Agents that learn from traces need trustworthy trace data.  
-Entropy0 gates what enters the trace before the model ever sees it.
+A trusted domain is not the same as usable evidence.  
+Entropy0 makes that distinction visible before the agent answers.
 
 ## What this does
 
