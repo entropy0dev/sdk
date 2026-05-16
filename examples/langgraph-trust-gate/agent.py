@@ -1,16 +1,22 @@
 """
 Entropy0 trust gate for LangGraph
 
-Pipeline: Search -> Trust gate -> Extract approved -> Synthesize
+Pipeline: Search -> Trust gate -> Extract -> Evidence scoring -> Synthesize
 
 Every URL returned by web search is evaluated through the Entropy0 /v1/decide
-endpoint before content enters the model context. Approved URLs are then
-extracted via Tavily Extract (clean markdown, not raw HTML). Sources that
-return sandbox or deny are logged and skipped. Trust metadata is attached
-to each step so it appears in LangSmith traces.
+endpoint before content enters the model context. Approved URLs are extracted
+via Tavily Extract (clean markdown, not raw HTML). A second layer — evidence
+usability scoring — classifies whether the extracted text is actually useful
+for answering the question. Sources that return sandbox or deny are logged and
+skipped. Trust and evidence metadata is attached to each step so it appears in
+LangSmith traces.
 
-Agents that learn from traces need trustworthy trace data.
-Entropy0 gates what enters the trace before the model ever sees it.
+Two distinct quality gates:
+  1. Entropy0 trust gate   — should this source enter the agent workflow?
+  2. Evidence usability    — did we retrieve enough text to safely cite it?
+
+An approved source with boilerplate-dominant extraction is clearly labelled
+so the synthesis step can calibrate confidence correctly.
 
 Setup:
     pip install -r requirements.txt
@@ -26,6 +32,7 @@ Run:
 """
 
 import os
+import re
 import sys
 import httpx
 from typing import TypedDict
@@ -56,6 +63,14 @@ POSITIVE_TRUST_CODES = {
     "KNOWN_BENIGN_PATTERN", "APEX_DOMAIN_TRUST_INHERITANCE",
 }
 
+# Terms that, when present in high density, indicate boilerplate rather than article text
+BOILERPLATE_SIGNALS = [
+    "cookie", "accept all", "privacy policy", "skip to content",
+    "sign in", "sign up", "log in", "register", "subscribe",
+    "toggle navigation", "breadcrumb", "all rights reserved",
+    "copyright ©", "consent", "gdpr", "terms of service",
+]
+
 def is_ugc(url: str) -> bool:
     return any(d in url for d in UGC_DOMAINS)
 
@@ -70,18 +85,74 @@ def infer_sandbox_reason(trust: float, threat: float, deviation: float) -> list[
         codes.append("INSUFFICIENT_TRUST_BAND")
     return codes or ["SCORE_BASED_GATE"]
 
+def score_evidence_usability(text: str) -> dict:
+    """
+    Classify extracted content quality into one of four tiers.
+
+    Returns:
+      content_status     — body_text_captured / partial / title_only /
+                           boilerplate_dominant / unusable
+      evidence_usability — high / medium / low / none
+      content_reason_codes — machine-readable reason list
+    """
+    cleaned = (text or "").strip()
+
+    if len(cleaned) < 100:
+        return {
+            "content_status":       "unusable",
+            "evidence_usability":   "none",
+            "content_reason_codes": ["NO_CONTENT_EXTRACTED"],
+        }
+
+    text_lower = cleaned.lower()
+    lines      = [l.strip() for l in cleaned.split("\n") if l.strip()]
+    n_lines    = max(len(lines), 1)
+
+    boilerplate_hits = sum(1 for sig in BOILERPLATE_SIGNALS if sig in text_lower)
+    short_line_ratio = sum(1 for l in lines if len(l) < 50) / n_lines
+    link_lines       = sum(1 for l in lines if re.search(r'\[.+?\]\(.+?\)', l))
+    link_density     = link_lines / n_lines
+
+    if boilerplate_hits >= 3 or (short_line_ratio > 0.65 and link_density > 0.30):
+        return {
+            "content_status":       "boilerplate_dominant",
+            "evidence_usability":   "low",
+            "content_reason_codes": ["BOILERPLATE_DOMINANT"],
+        }
+
+    if len(cleaned) < 400:
+        return {
+            "content_status":       "title_only",
+            "evidence_usability":   "low",
+            "content_reason_codes": ["TITLE_ONLY_EVIDENCE"],
+        }
+
+    if len(cleaned) < 1000 or boilerplate_hits >= 2:
+        return {
+            "content_status":       "partial",
+            "evidence_usability":   "medium",
+            "content_reason_codes": ["ARTICLE_BODY_PARTIAL"],
+        }
+
+    return {
+        "content_status":       "body_text_captured",
+        "evidence_usability":   "high",
+        "content_reason_codes": ["FULL_ARTICLE_BODY"],
+    }
+
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
 class ResearchState(TypedDict):
-    query:      str
-    urls:       list[str]
-    approved:   list[dict]   # passed trust gate
-    sandboxed:  list[dict]   # gated but not denied
-    denied:     list[dict]   # hard block
-    unverified: list[dict]   # could not gather evidence (timeout / extraction fail)
-    content:    list[str]
-    answer:     str
+    query:            str
+    urls:             list[str]
+    approved:         list[dict]   # passed trust gate
+    sandboxed:        list[dict]   # gated but not denied
+    denied:           list[dict]   # hard block
+    unverified:       list[dict]   # could not gather evidence (timeout / extraction fail)
+    content:          list[str]
+    evidence_quality: list[dict]   # per-source evidence usability scores
+    answer:           str
 
 
 # ── Entropy0 ──────────────────────────────────────────────────────────────────
@@ -166,8 +237,8 @@ def check_url(url: str) -> dict:
 def search_node(state: ResearchState) -> dict:
     tool   = TavilySearch(max_results=6, search_depth="advanced")
     result = tool.invoke(state["query"])
-    items = result.get("results", []) if isinstance(result, dict) else result
-    urls  = [r["url"] for r in items if isinstance(r, dict) and "url" in r]
+    items  = result.get("results", []) if isinstance(result, dict) else result
+    urls   = [r["url"] for r in items if isinstance(r, dict) and "url" in r]
     return {"urls": urls}
 
 
@@ -221,11 +292,12 @@ def trust_gate_node(state: ResearchState) -> dict:
 @traceable(name="extract_content")
 def fetch_node(state: ResearchState) -> dict:
     """
-    Use Tavily Extract to pull clean markdown from approved URLs.
-    Raw httpx.get returns boilerplate HTML — TavilyExtract returns article content.
+    Use Tavily Extract to pull clean markdown from approved URLs, then score
+    each result for evidence usability. Boilerplate-dominant or title-only
+    extraction is flagged so the synthesis step can calibrate confidence.
     """
     if not state["approved"]:
-        return {"content": []}
+        return {"content": [], "evidence_quality": []}
 
     approved_urls = [ev["url"] for ev in state["approved"]]
     ev_by_url     = {ev["url"]: ev for ev in state["approved"]}
@@ -235,19 +307,27 @@ def fetch_node(state: ResearchState) -> dict:
         result    = extractor.invoke({"urls": approved_urls})
     except Exception as e:
         print(f"[extract] TavilyExtract failed: {e}")
-        return {"content": []}
+        return {"content": [], "evidence_quality": []}
 
-    content = []
+    content          = []
+    evidence_quality = []
+
     for item in result.get("results", []):
-        url  = item.get("url", "")
-        text = (item.get("raw_content") or "").strip()
+        url   = item.get("url", "")
+        title = item.get("title", "")
+        text  = (item.get("raw_content") or "").strip()
+        ev    = ev_by_url.get(url, {})
+        eq    = score_evidence_usability(text)
+
+        evidence_quality.append({"url": url, "title": title, **eq})
+
         if not text:
             continue
-        ev = ev_by_url.get(url, {})
         content.append(
             f"[Source: {url}]\n"
             f"[Entropy0: trust={ev.get('trust','?')} threat={ev.get('threat','?')} "
-            f"deviation={ev.get('deviation','?')} action={ev.get('action','?')}]\n\n"
+            f"deviation={ev.get('deviation','?')} action={ev.get('action','?')}]\n"
+            f"[Evidence: {eq['content_status']} — usability={eq['evidence_usability']}]\n\n"
             f"{text[:3000]}"
         )
 
@@ -257,9 +337,29 @@ def fetch_node(state: ResearchState) -> dict:
         ev["action"]               = "unverified"
         ev["decision_reason_codes"] = ["CONTENT_UNAVAILABLE"]
         state["unverified"].append(ev)
+        evidence_quality.append({
+            "url":                  url,
+            "title":                "",
+            "content_status":       "unusable",
+            "evidence_usability":   "none",
+            "content_reason_codes": ["CONTENT_UNAVAILABLE"],
+        })
         print(f"  UNVERIFIED {url} — extraction failed")
 
-    return {"content": content}
+    _USABILITY_ICON = {
+        "body_text_captured":  "✓",
+        "partial":             "~",
+        "title_only":          "!",
+        "boilerplate_dominant":"!",
+        "unusable":            "✗",
+    }
+    print("\n[evidence layer]")
+    for eq in evidence_quality:
+        icon = _USABILITY_ICON.get(eq["content_status"], "?")
+        print(f"  {icon} {eq['url']}")
+        print(f"    {eq['content_status']} — usability={eq['evidence_usability']} {eq['content_reason_codes']}")
+
+    return {"content": content, "evidence_quality": evidence_quality}
 
 
 @traceable(name="synthesize")
@@ -272,28 +372,32 @@ def synthesize_node(state: ResearchState) -> dict:
         f"{len(state['unverified'])} unverified — could not gather evidence)."
     )
 
+    eq_lines = [
+        f"  - {eq['url']}: {eq['content_status']} (usability={eq['evidence_usability']})"
+        for eq in state.get("evidence_quality", [])
+    ]
+    eq_summary = "\n".join(eq_lines) if eq_lines else "  (no evidence quality data)"
+
     if state["content"]:
         context = "\n\n---\n\n".join(state["content"])
-        evidence_note = ""
     else:
-        context      = "No usable content was extracted from approved sources."
-        evidence_note = (
-            "\n\nEvidence quality note: the trust gate approved sources but the "
-            "extraction layer returned insufficient article text. Limit your answer "
-            "to what can be verified from source titles and metadata only. "
-            "Do not fabricate or infer details not present in the retrieved content."
-        )
+        context = "No usable content was extracted from approved sources."
 
     response = llm.invoke([{
         "role": "user",
         "content": (
             f"Research question: {state['query']}\n\n"
             f"Trust gate summary: {gate_summary}\n\n"
-            f"Content from approved sources only:\n\n{context}"
-            f"{evidence_note}\n\n"
-            "Answer the research question based solely on the approved sources above. "
-            "If extraction returned boilerplate rather than article text, say so clearly "
-            "as an evidence quality warning — do not fabricate details."
+            f"Evidence quality per approved source:\n{eq_summary}\n\n"
+            f"Content from approved sources only:\n\n{context}\n\n"
+            "Answer the research question based solely on the approved sources above.\n"
+            "Calibrate confidence strictly by evidence usability:\n"
+            "- usability=high: cite directly, high confidence\n"
+            "- usability=medium: cite with a caveat (partial extraction)\n"
+            "- usability=low: note the source exists but do not assert specific claims from it\n"
+            "- usability=none: mark as unusable, do not cite\n"
+            "If extraction returned boilerplate rather than article text, say so explicitly "
+            "as an evidence quality warning — do not fabricate or infer details."
         ),
     }])
     return {"answer": response.content}
@@ -325,20 +429,37 @@ if __name__ == "__main__":
 
     graph  = build_graph()
     result = graph.invoke({
-        "query":      query,
-        "urls":       [],
-        "approved":   [],
-        "sandboxed":  [],
-        "denied":     [],
-        "unverified": [],
-        "content":    [],
-        "answer":     "",
+        "query":            query,
+        "urls":             [],
+        "approved":         [],
+        "sandboxed":        [],
+        "denied":           [],
+        "unverified":       [],
+        "content":          [],
+        "evidence_quality": [],
+        "answer":           "",
     })
 
     print("\n" + "=" * 60)
     print("ANSWER")
     print("=" * 60)
     print(result["answer"])
+
+    if result.get("evidence_quality"):
+        print("\n" + "=" * 60)
+        print("EVIDENCE LAYER")
+        print("=" * 60)
+        _STATUS_LABEL = {
+            "body_text_captured":   "FULL",
+            "partial":              "PARTIAL",
+            "title_only":           "TITLE",
+            "boilerplate_dominant": "BOILERPLATE",
+            "unusable":             "UNUSABLE",
+        }
+        for eq in result["evidence_quality"]:
+            label = _STATUS_LABEL.get(eq["content_status"], eq["content_status"].upper())
+            print(f"  [{label}]  {eq['url']}")
+            print(f"             usability={eq['evidence_usability']}  {eq.get('content_reason_codes', [])}")
 
     blocked = result["sandboxed"] + result["denied"] + result["unverified"]
     if blocked:
